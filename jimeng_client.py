@@ -1,4 +1,4 @@
-"""即梦积分查询客户端（参考 iptag/jimeng-api 实现）。"""
+"""即梦 / 小云雀积分查询客户端。"""
 
 from __future__ import annotations
 
@@ -11,19 +11,12 @@ from typing import Any
 
 import requests
 
-BASE_URL_CN = "https://jimeng.jianying.com"
-DEFAULT_ASSISTANT_ID_CN = 513695
-REGION_CN = "cn"
 PLATFORM_CODE = "7"
-VERSION_CODE = "8.4.0"
-WEB_VERSION = "7.5.0"
-DA_VERSION = "3.3.9"
 
 FAKE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-language": "zh-CN,zh;q=0.9",
     "Cache-control": "no-cache",
-    "Appvr": VERSION_CODE,
     "Pragma": "no-cache",
     "Priority": "u=1, i",
     "Pf": PLATFORM_CODE,
@@ -34,13 +27,43 @@ FAKE_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
     ),
 }
 
 WEB_ID = random.randint(7000000000000000000, 7999999999999999999)
 USER_ID = uuid.uuid4().hex
+
+
+@dataclass(frozen=True)
+class PlatformConfig:
+    base_url: str
+    app_id: str
+    version_code: str
+    referer: str
+    receive_body: dict[str, Any]
+    sign_prefix: str = "9e2c"
+    use_entrance_from: bool = False
+
+
+PLATFORMS: dict[str, PlatformConfig] = {
+    "jimeng": PlatformConfig(
+        base_url="https://jimeng.jianying.com",
+        app_id="513695",
+        version_code="8.4.0",
+        referer="https://jimeng.jianying.com/ai-tool/image/generate",
+        receive_body={"time_zone": "Asia/Shanghai"},
+    ),
+    "xyq": PlatformConfig(
+        base_url="https://xyq.jianying.com",
+        app_id="795647",
+        version_code="5.8.0",
+        referer="https://xyq.jianying.com/",
+        receive_body={"source": "web"},
+        use_entrance_from=True,
+    ),
+}
 
 
 @dataclass
@@ -74,38 +97,50 @@ def _generate_cookie(sessionid: str) -> str:
     )
 
 
-def _make_sign(uri: str, device_time: int) -> str:
-    raw = f"9e2c|{uri[-7:]}|{PLATFORM_CODE}|{VERSION_CODE}|{device_time}||11ac"
+def _make_sign(uri: str, device_time: int, platform: PlatformConfig) -> str:
+    raw = (
+        f"{platform.sign_prefix}|{uri[-7:]}|{PLATFORM_CODE}|"
+        f"{platform.version_code}|{device_time}||11ac"
+    )
     return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _get_platform(platform: str) -> PlatformConfig:
+    cfg = PLATFORMS.get(platform)
+    if not cfg:
+        raise ValueError(f"不支持的平台: {platform}，可选: {', '.join(PLATFORMS)}")
+    return cfg
 
 
 def _request(
     method: str,
     uri: str,
+    platform: str,
     sessionid: str = "",
     *,
     cookie: str | None = None,
     data: dict[str, Any] | None = None,
     extra_params: dict[str, Any] | None = None,
-    referer: str = "https://jimeng.jianying.com/ai-tool/image/generate",
+    referer: str | None = None,
     no_default_params: bool = False,
 ) -> dict[str, Any]:
+    cfg = _get_platform(platform)
     device_time = _unix_timestamp()
-    sign = _make_sign(uri, device_time)
-    url = f"{BASE_URL_CN}{uri}"
+    sign = _make_sign(uri, device_time, cfg)
+    url = f"{cfg.base_url}{uri}"
 
     params: dict[str, Any] = {}
-    if not no_default_params:
+    if not no_default_params and platform == "jimeng":
         params.update(
             {
-                "aid": DEFAULT_ASSISTANT_ID_CN,
+                "aid": int(cfg.app_id),
                 "device_platform": "web",
-                "region": REGION_CN,
+                "region": "cn",
                 "webId": WEB_ID,
-                "da_version": DA_VERSION,
+                "da_version": "3.3.9",
                 "os": "windows",
                 "web_component_open_flag": 1,
-                "web_version": WEB_VERSION,
+                "web_version": "7.5.0",
                 "aigc_features": "app_lip_sync",
             }
         )
@@ -115,19 +150,24 @@ def _request(
     cookie_header = cookie.strip() if cookie else _generate_cookie(sessionid)
     headers = {
         **FAKE_HEADERS,
-        "Origin": BASE_URL_CN,
-        "Referer": referer,
-        "App-Sdk-Version": "48.0.0",
-        "Appid": str(DEFAULT_ASSISTANT_ID_CN),
+        "Origin": cfg.base_url,
+        "Referer": referer or cfg.referer,
+        "Appvr": cfg.version_code,
+        "Appid": cfg.app_id,
         "Cookie": cookie_header,
         "Device-Time": str(device_time),
-        "Lan": "zh-Hans",
-        "Loc": "cn",
         "Sign": sign,
         "Sign-Ver": "1",
         "Tdid": "",
         "Content-Type": "application/json",
     }
+    if cfg.use_entrance_from:
+        headers["entrance-from"] = "web"
+        headers["Loc"] = "CN"
+    else:
+        headers["App-Sdk-Version"] = "48.0.0"
+        headers["Lan"] = "zh-Hans"
+        headers["Loc"] = "cn"
 
     response = requests.request(
         method=method,
@@ -142,26 +182,33 @@ def _request(
         payload = response.json()
     except ValueError as exc:
         raise RuntimeError(
-            f"即梦 API 返回非 JSON (HTTP {response.status_code}): {response.text[:200]}"
+            f"{platform} API 返回非 JSON (HTTP {response.status_code}): "
+            f"{response.text[:200]}"
         ) from exc
 
     ret = payload.get("ret")
     if ret not in (0, "0", None):
         errmsg = payload.get("errmsg") or payload.get("msg") or "未知错误"
-        raise RuntimeError(f"即梦 API 错误 ret={ret}: {errmsg}")
+        raise RuntimeError(f"{platform} API 错误 ret={ret}: {errmsg}")
 
     data_payload = payload.get("data", payload)
     if isinstance(data_payload, dict) and data_payload.get("error_code"):
         description = data_payload.get("description") or "未知错误"
-        raise RuntimeError(f"即梦 API 错误: {description}")
+        raise RuntimeError(f"{platform} API 错误: {description}")
 
     return data_payload
 
 
-def get_credit(sessionid: str = "", cookie: str | None = None) -> CreditInfo:
+def get_credit(
+    sessionid: str = "",
+    cookie: str | None = None,
+    *,
+    platform: str = "jimeng",
+) -> CreditInfo:
     data = _request(
         "POST",
         "/commerce/v1/benefits/user_credit",
+        platform,
         sessionid,
         cookie=cookie,
         data={},
@@ -175,21 +222,38 @@ def get_credit(sessionid: str = "", cookie: str | None = None) -> CreditInfo:
     )
 
 
-def receive_credit(sessionid: str = "", cookie: str | None = None) -> int:
+def receive_credit(
+    sessionid: str = "",
+    cookie: str | None = None,
+    *,
+    platform: str = "jimeng",
+) -> int:
+    cfg = _get_platform(platform)
+    receive_referer = (
+        f"{cfg.base_url}/"
+        if platform == "xyq"
+        else "https://jimeng.jianying.com/ai-tool/home/"
+    )
     data = _request(
         "POST",
         "/commerce/v1/benefits/credit_receive",
+        platform,
         sessionid,
         cookie=cookie,
-        data={"time_zone": "Asia/Shanghai"},
-        referer="https://jimeng.jianying.com/ai-tool/home/",
+        data=cfg.receive_body,
+        referer=receive_referer,
     )
     return int(data.get("receive_quota") or 0)
 
 
-def check_token_live(sessionid: str = "", cookie: str | None = None) -> bool:
+def check_token_live(
+    sessionid: str = "",
+    cookie: str | None = None,
+    *,
+    platform: str = "jimeng",
+) -> bool:
     try:
-        get_credit(sessionid=sessionid, cookie=cookie)
+        get_credit(sessionid=sessionid, cookie=cookie, platform=platform)
         return True
     except Exception:
         return False

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""批量查询即梦账号积分并同步到飞书表格。"""
+"""批量查询即梦 / 小云雀积分并同步到飞书表格。"""
 
 from __future__ import annotations
 
@@ -14,21 +14,80 @@ import yaml
 from feishu_client import FeishuClient, col_letter
 from jimeng_client import check_token_live, get_credit, receive_credit
 
+PLATFORM_LABELS = {
+    "jimeng": "即梦",
+    "xyq": "小云雀",
+}
 
-def _resolve_jimeng_auth(account: dict[str, Any]) -> tuple[str, str | None]:
+
+def _resolve_account_cookies(account: dict[str, Any]) -> dict[str, str | None]:
+    jimeng_cookie = str(account.get("cookie") or "").strip() or None
+    xyq_cookie = str(account.get("xyq_cookie") or "").strip() or None
     sessionid = str(account.get("sessionid") or "").strip()
-    cookie = str(account.get("cookie") or "").strip() or None
-    if not cookie and not sessionid:
-        raise ValueError("账号配置需要 cookie 或 sessionid")
-    return sessionid, cookie
+
+    if not jimeng_cookie and not xyq_cookie and not sessionid:
+        raise ValueError(
+            "账号至少需配置一项：cookie（即梦）、xyq_cookie（小云雀）或 sessionid（即梦旧方式）"
+        )
+
+    return {
+        "jimeng": jimeng_cookie,
+        "xyq": xyq_cookie,
+        "sessionid": sessionid or "",
+    }
 
 
-def _auth_error_message(cookie: str | None) -> str:
-    if cookie:
-        return "登录凭证无效，无法查询积分，请重新从浏览器 curl 复制 Cookie"
-    return (
-        "仅 sessionid 通常不够用，请从浏览器 Network 复制 curl 里的完整 Cookie（-b 后面的内容）"
-    )
+def _auth_error_message(platform: str) -> str:
+    label = PLATFORM_LABELS.get(platform, platform)
+    return f"{label} 登录凭证无效，请从 xyq.jianying.com 或 jimeng.jianying.com 复制 curl Cookie"
+
+
+def _fetch_account_credits(
+    account: dict[str, Any], jimeng_cfg: dict[str, Any]
+) -> dict[str, int]:
+    cookies = _resolve_account_cookies(account)
+    sessionid = cookies["sessionid"]
+    auto_receive = jimeng_cfg.get("auto_receive", False)
+    credits: dict[str, int] = {}
+    errors: list[str] = []
+
+    for platform in ("jimeng", "xyq"):
+        cookie = cookies[platform]
+        label = PLATFORM_LABELS[platform]
+
+        if platform == "xyq" and not cookie:
+            print(f"  [{label}] 未配置 xyq_cookie，跳过")
+            continue
+        if platform == "jimeng" and not cookie and not sessionid:
+            print(f"  [{label}] 未配置 cookie，跳过")
+            continue
+
+        try:
+            if not check_token_live(sessionid, cookie=cookie, platform=platform):
+                raise RuntimeError(_auth_error_message(platform))
+
+            if auto_receive:
+                try:
+                    receive_credit(sessionid, cookie=cookie, platform=platform)
+                    print(f"  [{label}] 已尝试领取每日积分")
+                except Exception as exc:
+                    print(f"  [{label}] 领取积分失败（继续查询）: {exc}")
+
+            credit = get_credit(sessionid, cookie=cookie, platform=platform)
+            total = credit.total_credit
+            credits[platform] = total
+            print(
+                f"  [{label}] 积分: 赠送={credit.gift_credit}, "
+                f"购买={credit.purchase_credit}, VIP={credit.vip_credit}, "
+                f"总计={total}"
+            )
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+            print(f"  [{label}] 查询失败: {exc}")
+
+    if not credits and errors:
+        raise RuntimeError("; ".join(errors))
+    return credits
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -87,6 +146,63 @@ def _build_header_index(header_row: list[Any], field_map: dict[str, str]) -> dic
     return index
 
 
+_SHEET_FIELD_ORDER = (
+    "channel",
+    "name",
+    "phone",
+    "current_credit",
+    "xyq_credit",
+    "updated_at",
+)
+
+
+def _ensure_sheet_headers(
+    feishu: FeishuClient,
+    spreadsheet_token: str,
+    sheet_id: str,
+    header_row: list[Any],
+    field_map: dict[str, str],
+    *,
+    dry_run: bool = False,
+) -> list[Any]:
+    """补全飞书表头缺失列，避免查到积分却写不进去。"""
+    header_to_col = {
+        _cell_text(name): idx for idx, name in enumerate(header_row) if _cell_text(name)
+    }
+    row = list(header_row)
+    updates: list[tuple[str, list[list[Any]]]] = []
+
+    for key in _SHEET_FIELD_ORDER:
+        title = field_map.get(key, "")
+        if not title or title in header_to_col:
+            continue
+
+        insert_at = 0
+        for prev in _SHEET_FIELD_ORDER:
+            if prev == key:
+                break
+            prev_title = field_map.get(prev, "")
+            if prev_title in header_to_col:
+                insert_at = header_to_col[prev_title] + 1
+
+        if insert_at < len(row) and _cell_text(row[insert_at]):
+            insert_at = max(header_to_col.values(), default=-1) + 1
+
+        while len(row) <= insert_at:
+            row.append(None)
+
+        row[insert_at] = title
+        header_to_col[title] = insert_at
+        cell = f"{col_letter(insert_at)}1"
+        updates.append((f"{sheet_id}!{cell}:{cell}", [[title]]))
+        print(f"  飞书表头缺少「{title}」，将写入第 {insert_at + 1} 列（{cell}）")
+
+    if updates and not dry_run:
+        feishu.batch_update_sheet_cells(spreadsheet_token, updates)
+
+    return row
+
+
 def _build_sheet_row_index(
     rows: list[list[Any]],
     header_index: dict[str, int],
@@ -139,11 +255,14 @@ def sync_spreadsheet(
     if not rows:
         raise RuntimeError("飞书表格为空，请至少保留一行表头")
 
+    rows[0] = _ensure_sheet_headers(
+        feishu, spreadsheet_token, sheet_id, rows[0], field_map, dry_run=dry_run
+    )
     header_index = _build_header_index(rows[0], field_map)
-    required = ["name", "current_credit"]
-    missing = [field_map[k] for k in required if k not in header_index]
-    if missing:
-        raise ValueError(f"表头缺少必要列: {', '.join(missing)}")
+    if "name" not in header_index:
+        raise ValueError(f"表头缺少必要列: {field_map.get('name', '名称')}")
+    if "current_credit" not in header_index and "xyq_credit" not in header_index:
+        raise ValueError("表头需至少包含「当前即梦积分」或「当前小云雀积分」列")
 
     row_index = _build_sheet_row_index(rows, header_index, match_by)
     updates: list[tuple[str, list[list[Any]]]] = []
@@ -155,29 +274,12 @@ def sync_spreadsheet(
         channel = account.get("channel", "")
         name = account["name"]
         phone = str(account.get("phone") or "").strip()
-        sessionid, cookie = _resolve_jimeng_auth(account)
         match_key = phone if match_by == "phone" else name
 
         print(f"\n处理: {channel} | {name} | {phone or '(无手机号)'}")
 
         try:
-            if not check_token_live(sessionid, cookie=cookie):
-                raise RuntimeError(_auth_error_message(cookie))
-
-            if jimeng_cfg.get("auto_receive"):
-                try:
-                    receive_credit(sessionid, cookie=cookie)
-                    print("  已尝试领取每日积分")
-                except Exception as exc:
-                    print(f"  领取积分失败（继续查询）: {exc}")
-
-            credit = get_credit(sessionid, cookie=cookie)
-            total = credit.total_credit
-            print(
-                f"  积分: 赠送={credit.gift_credit}, "
-                f"购买={credit.purchase_credit}, VIP={credit.vip_credit}, "
-                f"当前积分={total}"
-            )
+            credit_totals = _fetch_account_credits(account, jimeng_cfg)
         except Exception as exc:
             print(f"  查询失败: {exc}")
             success_count += 1
@@ -187,12 +289,22 @@ def sync_spreadsheet(
         existing_row = row_index.get(match_key)
 
         if existing_row:
-            updates.append(
-                (
-                    _sheet_range(sheet_id, existing_row, header_index["current_credit"]),
-                    [[total]],
+            if "current_credit" in header_index and "jimeng" in credit_totals:
+                updates.append(
+                    (
+                        _sheet_range(
+                            sheet_id, existing_row, header_index["current_credit"]
+                        ),
+                        [[credit_totals["jimeng"]]],
+                    )
                 )
-            )
+            if "xyq_credit" in header_index and "xyq" in credit_totals:
+                updates.append(
+                    (
+                        _sheet_range(sheet_id, existing_row, header_index["xyq_credit"]),
+                        [[credit_totals["xyq"]]],
+                    )
+                )
             if "updated_at" in header_index:
                 updates.append(
                     (
@@ -211,17 +323,23 @@ def sync_spreadsheet(
             new_row[header_index["name"]] = name
             if phone and "phone" in header_index:
                 new_row[header_index["phone"]] = phone
-            new_row[header_index["current_credit"]] = total
+            if "current_credit" in header_index and "jimeng" in credit_totals:
+                new_row[header_index["current_credit"]] = credit_totals["jimeng"]
+            if "xyq_credit" in header_index and "xyq" in credit_totals:
+                new_row[header_index["xyq_credit"]] = credit_totals["xyq"]
             if "updated_at" in header_index:
                 new_row[header_index["updated_at"]] = now_text
             append_rows.append((next_row, new_row))
             action = f"新增第 {next_row} 行"
             next_row += 1
 
+        summary = ", ".join(
+            f"{PLATFORM_LABELS[k]}={v}" for k, v in credit_totals.items()
+        )
         if dry_run:
-            print(f"  [dry-run] {action}，当前积分={total}，更新时间={now_text}")
+            print(f"  [dry-run] {action}，{summary}，更新时间={now_text}")
         else:
-            print(f"  {action}，当前积分={total}，更新时间={now_text}")
+            print(f"  {action}，{summary}，更新时间={now_text}")
 
         success_count += 1
 
@@ -263,29 +381,12 @@ def sync_bitable(
         channel = account.get("channel", "")
         name = account["name"]
         phone = str(account.get("phone") or "").strip()
-        sessionid, cookie = _resolve_jimeng_auth(account)
         match_key = phone if match_by == "phone" else name
 
         print(f"\n处理: {channel} | {name} | {phone or '(无手机号)'}")
 
         try:
-            if not check_token_live(sessionid, cookie=cookie):
-                raise RuntimeError(_auth_error_message(cookie))
-
-            if jimeng_cfg.get("auto_receive"):
-                try:
-                    receive_credit(sessionid, cookie=cookie)
-                    print("  已尝试领取每日积分")
-                except Exception as exc:
-                    print(f"  领取积分失败（继续查询）: {exc}")
-
-            credit = get_credit(sessionid, cookie=cookie)
-            total = credit.total_credit
-            print(
-                f"  积分: 赠送={credit.gift_credit}, "
-                f"购买={credit.purchase_credit}, VIP={credit.vip_credit}, "
-                f"当前积分={total}"
-            )
+            credit_totals = _fetch_account_credits(account, jimeng_cfg)
         except Exception as exc:
             print(f"  查询失败: {exc}")
             success_count += 1
@@ -295,30 +396,41 @@ def sync_bitable(
         existing = record_index.get(match_key)
 
         if existing:
-            fields = {field_map["current_credit"]: total}
+            fields: dict[str, Any] = {}
+            if "current_credit" in field_map and "jimeng" in credit_totals:
+                fields[field_map["current_credit"]] = credit_totals["jimeng"]
+            if "xyq_credit" in field_map and "xyq" in credit_totals:
+                fields[field_map["xyq_credit"]] = credit_totals["xyq"]
         else:
             fields = {
                 field_map["channel"]: channel,
                 field_map["name"]: name,
-                field_map["current_credit"]: total,
             }
             if phone:
                 fields[field_map["phone"]] = phone
+            if "current_credit" in field_map and "jimeng" in credit_totals:
+                fields[field_map["current_credit"]] = credit_totals["jimeng"]
+            if "xyq_credit" in field_map and "xyq" in credit_totals:
+                fields[field_map["xyq_credit"]] = credit_totals["xyq"]
 
         if field_map.get("updated_at"):
             fields[field_map["updated_at"]] = now_text
 
+        summary = ", ".join(
+            f"{PLATFORM_LABELS[k]}={v}" for k, v in credit_totals.items()
+        )
+
         if dry_run:
-            print(f"  [dry-run] 写入字段: {fields}")
+            print(f"  [dry-run] 写入字段: {fields} ({summary})")
             success_count += 1
             continue
 
         if existing:
             feishu.update_record(app_token, table_id, existing["record_id"], fields)
-            print(f"  已更新「当前积分」: {total}，更新时间: {now_text}")
+            print(f"  已更新: {summary}，更新时间: {now_text}")
         else:
             to_create.append({"fields": fields})
-            print(f"  待新增记录，当前积分: {total}，更新时间: {now_text}")
+            print(f"  待新增记录: {summary}，更新时间: {now_text}")
 
         success_count += 1
 
@@ -354,7 +466,7 @@ def sync_points(config_path: Path, dry_run: bool = False) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="同步即梦账号积分到飞书表格")
+    parser = argparse.ArgumentParser(description="同步即梦 / 小云雀积分到飞书表格")
     parser.add_argument(
         "-c",
         "--config",
