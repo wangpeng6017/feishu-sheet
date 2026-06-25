@@ -8,6 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -18,6 +19,12 @@ PLATFORM_LABELS = {
     "jimeng": "即梦",
     "xyq": "小云雀",
 }
+
+TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _now_text() -> str:
+    return datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _resolve_account_cookies(account: dict[str, Any]) -> dict[str, str | None]:
@@ -312,7 +319,7 @@ def sync_spreadsheet(
             success_count += 1
             continue
 
-        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_text = _now_text()
         existing_row = row_index.get(match_key)
         total_credit = _combined_credit(credit_totals)
 
@@ -412,7 +419,7 @@ def sync_bitable(
             success_count += 1
             continue
 
-        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_text = _now_text()
         existing = record_index.get(match_key)
         total_credit = _combined_credit(credit_totals)
 
