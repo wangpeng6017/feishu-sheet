@@ -90,6 +90,11 @@ def _fetch_account_credits(
     return credits
 
 
+def _combined_credit(credit_totals: dict[str, int]) -> int:
+    """即梦 + 小云雀积分合计（未配置的平台不计入）。"""
+    return sum(credit_totals.values())
+
+
 def load_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(
@@ -137,12 +142,33 @@ def _resolve_feishu_target(feishu_cfg: dict[str, Any]) -> dict[str, str]:
     }
 
 
+_FIELD_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
+    "current_credit": ("当前积分", "当前即梦积分"),
+}
+
+
+def _resolve_field_header(field_map: dict[str, str], key: str) -> str:
+    return field_map.get(key, "")
+
+
+def _field_header_titles(field_map: dict[str, str], key: str) -> tuple[str, ...]:
+    primary = _resolve_field_header(field_map, key)
+    aliases = _FIELD_HEADER_ALIASES.get(key, ())
+    titles: list[str] = []
+    for title in (primary, *aliases):
+        if title and title not in titles:
+            titles.append(title)
+    return tuple(titles)
+
+
 def _build_header_index(header_row: list[Any], field_map: dict[str, str]) -> dict[str, int]:
     header_to_col = {_cell_text(name): idx for idx, name in enumerate(header_row)}
     index: dict[str, int] = {}
-    for key, title in field_map.items():
-        if title in header_to_col:
-            index[key] = header_to_col[title]
+    for key in field_map:
+        for title in _field_header_titles(field_map, key):
+            if title in header_to_col:
+                index[key] = header_to_col[title]
+                break
     return index
 
 
@@ -151,7 +177,6 @@ _SHEET_FIELD_ORDER = (
     "name",
     "phone",
     "current_credit",
-    "xyq_credit",
     "updated_at",
 )
 
@@ -173,17 +198,19 @@ def _ensure_sheet_headers(
     updates: list[tuple[str, list[list[Any]]]] = []
 
     for key in _SHEET_FIELD_ORDER:
-        title = field_map.get(key, "")
-        if not title or title in header_to_col:
+        titles = _field_header_titles(field_map, key)
+        if not titles or any(title in header_to_col for title in titles):
             continue
+        title = titles[0]
 
         insert_at = 0
         for prev in _SHEET_FIELD_ORDER:
             if prev == key:
                 break
-            prev_title = field_map.get(prev, "")
-            if prev_title in header_to_col:
-                insert_at = header_to_col[prev_title] + 1
+            for prev_title in _field_header_titles(field_map, prev):
+                if prev_title in header_to_col:
+                    insert_at = header_to_col[prev_title] + 1
+                    break
 
         if insert_at < len(row) and _cell_text(row[insert_at]):
             insert_at = max(header_to_col.values(), default=-1) + 1
@@ -261,8 +288,8 @@ def sync_spreadsheet(
     header_index = _build_header_index(rows[0], field_map)
     if "name" not in header_index:
         raise ValueError(f"表头缺少必要列: {field_map.get('name', '名称')}")
-    if "current_credit" not in header_index and "xyq_credit" not in header_index:
-        raise ValueError("表头需至少包含「当前即梦积分」或「当前小云雀积分」列")
+    if "current_credit" not in header_index:
+        raise ValueError(f"表头缺少必要列: {field_map.get('current_credit', '当前积分')}")
 
     row_index = _build_sheet_row_index(rows, header_index, match_by)
     updates: list[tuple[str, list[list[Any]]]] = []
@@ -287,22 +314,16 @@ def sync_spreadsheet(
 
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         existing_row = row_index.get(match_key)
+        total_credit = _combined_credit(credit_totals)
 
         if existing_row:
-            if "current_credit" in header_index and "jimeng" in credit_totals:
+            if "current_credit" in header_index:
                 updates.append(
                     (
                         _sheet_range(
                             sheet_id, existing_row, header_index["current_credit"]
                         ),
-                        [[credit_totals["jimeng"]]],
-                    )
-                )
-            if "xyq_credit" in header_index and "xyq" in credit_totals:
-                updates.append(
-                    (
-                        _sheet_range(sheet_id, existing_row, header_index["xyq_credit"]),
-                        [[credit_totals["xyq"]]],
+                        [[total_credit]],
                     )
                 )
             if "updated_at" in header_index:
@@ -323,10 +344,8 @@ def sync_spreadsheet(
             new_row[header_index["name"]] = name
             if phone and "phone" in header_index:
                 new_row[header_index["phone"]] = phone
-            if "current_credit" in header_index and "jimeng" in credit_totals:
-                new_row[header_index["current_credit"]] = credit_totals["jimeng"]
-            if "xyq_credit" in header_index and "xyq" in credit_totals:
-                new_row[header_index["xyq_credit"]] = credit_totals["xyq"]
+            if "current_credit" in header_index:
+                new_row[header_index["current_credit"]] = total_credit
             if "updated_at" in header_index:
                 new_row[header_index["updated_at"]] = now_text
             append_rows.append((next_row, new_row))
@@ -336,10 +355,11 @@ def sync_spreadsheet(
         summary = ", ".join(
             f"{PLATFORM_LABELS[k]}={v}" for k, v in credit_totals.items()
         )
+        credit_text = f"当前积分={total_credit}（{summary}）" if len(credit_totals) > 1 else f"当前积分={total_credit}"
         if dry_run:
-            print(f"  [dry-run] {action}，{summary}，更新时间={now_text}")
+            print(f"  [dry-run] {action}，{credit_text}，更新时间={now_text}")
         else:
-            print(f"  {action}，{summary}，更新时间={now_text}")
+            print(f"  {action}，{credit_text}，更新时间={now_text}")
 
         success_count += 1
 
@@ -394,13 +414,12 @@ def sync_bitable(
 
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         existing = record_index.get(match_key)
+        total_credit = _combined_credit(credit_totals)
 
         if existing:
             fields: dict[str, Any] = {}
-            if "current_credit" in field_map and "jimeng" in credit_totals:
-                fields[field_map["current_credit"]] = credit_totals["jimeng"]
-            if "xyq_credit" in field_map and "xyq" in credit_totals:
-                fields[field_map["xyq_credit"]] = credit_totals["xyq"]
+            if "current_credit" in field_map:
+                fields[field_map["current_credit"]] = total_credit
         else:
             fields = {
                 field_map["channel"]: channel,
@@ -408,10 +427,8 @@ def sync_bitable(
             }
             if phone:
                 fields[field_map["phone"]] = phone
-            if "current_credit" in field_map and "jimeng" in credit_totals:
-                fields[field_map["current_credit"]] = credit_totals["jimeng"]
-            if "xyq_credit" in field_map and "xyq" in credit_totals:
-                fields[field_map["xyq_credit"]] = credit_totals["xyq"]
+            if "current_credit" in field_map:
+                fields[field_map["current_credit"]] = total_credit
 
         if field_map.get("updated_at"):
             fields[field_map["updated_at"]] = now_text
@@ -419,18 +436,19 @@ def sync_bitable(
         summary = ", ".join(
             f"{PLATFORM_LABELS[k]}={v}" for k, v in credit_totals.items()
         )
+        credit_text = f"当前积分={total_credit}（{summary}）" if len(credit_totals) > 1 else f"当前积分={total_credit}"
 
         if dry_run:
-            print(f"  [dry-run] 写入字段: {fields} ({summary})")
+            print(f"  [dry-run] 写入字段: {fields} ({credit_text})")
             success_count += 1
             continue
 
         if existing:
             feishu.update_record(app_token, table_id, existing["record_id"], fields)
-            print(f"  已更新: {summary}，更新时间: {now_text}")
+            print(f"  已更新: {credit_text}，更新时间: {now_text}")
         else:
             to_create.append({"fields": fields})
-            print(f"  待新增记录: {summary}，更新时间: {now_text}")
+            print(f"  待新增记录: {credit_text}，更新时间: {now_text}")
 
         success_count += 1
 

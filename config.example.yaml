@@ -15,8 +15,7 @@ feishu:
     channel: "频道"
     name: "名称"
     phone: "账号"
-    current_credit: "当前即梦积分"
-    xyq_credit: "当前小云雀积分"
+    current_credit: "当前积分"
     updated_at: "更新时间"
   # 匹配已有行: phone=按「账号」列 | name=按「名称」列
   match_by: "phone"
