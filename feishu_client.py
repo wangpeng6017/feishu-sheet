@@ -111,6 +111,25 @@ class FeishuClient:
             json={"valueRanges": value_ranges},
         )
 
+    def batch_update_sheet_styles(
+        self,
+        spreadsheet_token: str,
+        styles: list[tuple[str, dict[str, Any]]],
+    ) -> None:
+        if not styles:
+            return
+
+        self._request(
+            "PUT",
+            f"/sheets/v2/spreadsheets/{spreadsheet_token}/styles_batch_update",
+            json={
+                "data": [
+                    {"ranges": [range_str], "style": style}
+                    for range_str, style in styles
+                ]
+            },
+        )
+
     def append_sheet_row(
         self,
         spreadsheet_token: str,

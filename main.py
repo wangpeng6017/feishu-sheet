@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -23,10 +24,88 @@ PLATFORM_LABELS = {
 }
 
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
+REFRESH_WARN_STYLE = {
+    "backColor": "#FFC7CE",
+    "foreColor": "#9C0006",
+    "font": {"bold": True},
+}
+REFRESH_NORMAL_STYLE = {
+    "backColor": "#FFFFFF",
+    "foreColor": "#000000",
+    "font": {"bold": False},
+}
+
+
+def _today() -> date:
+    return datetime.now(TZ_SHANGHAI).date()
 
 
 def _now_text() -> str:
     return datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_refresh_anchor(value: Any) -> date | None:
+    """解析「账号积分刷新时间」，取其中的日作为每月刷新日。"""
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    text = _cell_text(value).replace("/", ".").replace("-", ".")
+    if not text:
+        return None
+
+    match = re.fullmatch(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", text)
+    if match:
+        year, month, day = (int(match.group(i)) for i in range(1, 4))
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    for fmt in ("%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+
+    if isinstance(value, (int, float)):
+        base = date(1899, 12, 30)
+        try:
+            return base + timedelta(days=int(value))
+        except OverflowError:
+            return None
+
+    return None
+
+
+def _next_refresh_date(anchor: date, today: date | None = None) -> date:
+    """根据刷新锚定日期的「日」，计算下一次刷新日期。"""
+    import calendar
+
+    today = today or _today()
+    refresh_day = anchor.day
+
+    def clamp_day(year: int, month: int) -> int:
+        return min(refresh_day, calendar.monthrange(year, month)[1])
+
+    candidate = date(today.year, today.month, clamp_day(today.year, today.month))
+    if candidate >= today:
+        return candidate
+
+    if today.month == 12:
+        year, month = today.year + 1, 1
+    else:
+        year, month = today.year, today.month + 1
+    return date(year, month, clamp_day(year, month))
+
+
+def _days_until_refresh(anchor: date, today: date | None = None) -> int:
+    today = today or _today()
+    return (_next_refresh_date(anchor, today) - today).days
 
 
 def _resolve_account_cookies(account: dict[str, Any]) -> dict[str, str | None]:
@@ -217,6 +296,8 @@ _SHEET_FIELD_ORDER = (
     "phone",
     "current_credit",
     "updated_at",
+    "credit_refresh_at",
+    "days_until_refresh",
 )
 
 
@@ -306,6 +387,76 @@ def _sheet_range(sheet_id: str, row: int, col: int) -> str:
     return f"{sheet_id}!{cell}:{cell}"
 
 
+def _sync_refresh_reminders(
+    feishu: FeishuClient,
+    spreadsheet_token: str,
+    sheet_id: str,
+    rows: list[list[Any]],
+    header_index: dict[str, int],
+    field_map: dict[str, str],
+    *,
+    warning_days: int = 7,
+    dry_run: bool = False,
+) -> None:
+    """根据「账号积分刷新时间」计算距下次刷新天数，7 天内标红提醒。"""
+    refresh_col = header_index.get("credit_refresh_at")
+    days_col = header_index.get("days_until_refresh")
+    if refresh_col is None:
+        title = field_map.get("credit_refresh_at", "账号积分刷新时间")
+        print(f"\n跳过积分刷新提醒：表头缺少「{title}」列")
+        return
+    if days_col is None:
+        title = field_map.get("days_until_refresh", "距下次刷新(天)")
+        print(f"\n跳过积分刷新提醒：表头缺少「{title}」列")
+        return
+
+    days_title = field_map.get("days_until_refresh", "距下次刷新(天)")
+    today = _today()
+    updates: list[tuple[str, list[list[Any]]]] = []
+    styles: list[tuple[str, dict[str, Any]]] = []
+    warn_count = 0
+    filled_count = 0
+
+    for row_number, row in enumerate(rows[1:], start=2):
+        raw = row[refresh_col] if refresh_col < len(row) else None
+        anchor = _parse_refresh_anchor(raw)
+        if anchor is None:
+            updates.append(
+                (_sheet_range(sheet_id, row_number, days_col), [[""]])
+            )
+            styles.append(
+                (_sheet_range(sheet_id, row_number, days_col), REFRESH_NORMAL_STYLE)
+            )
+            continue
+
+        days = _days_until_refresh(anchor, today)
+        updates.append(
+            (_sheet_range(sheet_id, row_number, days_col), [[days]])
+        )
+        style = REFRESH_WARN_STYLE if days < warning_days else REFRESH_NORMAL_STYLE
+        styles.append((_sheet_range(sheet_id, row_number, days_col), style))
+        filled_count += 1
+        if days < warning_days:
+            warn_count += 1
+
+    if dry_run:
+        print(
+            f"\n[dry-run] 将更新 {filled_count} 行「{days_title}」，"
+            f"其中 {warn_count} 行距刷新不足 {warning_days} 天（标红）"
+        )
+        return
+
+    if updates:
+        feishu.batch_update_sheet_cells(spreadsheet_token, updates)
+    if styles:
+        feishu.batch_update_sheet_styles(spreadsheet_token, styles)
+
+    print(
+        f"\n已更新 {filled_count} 行「{days_title}」，"
+        f"其中 {warn_count} 行距刷新不足 {warning_days} 天（已标红）"
+    )
+
+
 def sync_spreadsheet(
     feishu: FeishuClient,
     target: dict[str, str],
@@ -313,6 +464,7 @@ def sync_spreadsheet(
     match_by: str,
     jimeng_cfg: dict[str, Any],
     dry_run: bool = False,
+    refresh_warning_days: int = 7,
 ) -> int:
     spreadsheet_token = target["spreadsheet_token"]
     sheet_id = target["sheet_id"]
@@ -404,17 +556,27 @@ def sync_spreadsheet(
 
     if dry_run:
         print(f"\n[dry-run] 将更新 {len(updates)} 个单元格，新增 {len(append_rows)} 行")
-        return success_count
+    else:
+        feishu.batch_update_sheet_cells(spreadsheet_token, updates)
 
-    feishu.batch_update_sheet_cells(spreadsheet_token, updates)
+        append_updates: list[tuple[str, list[list[Any]]]] = []
+        for row_number, row_values in append_rows:
+            end_col = col_letter(len(row_values) - 1)
+            append_updates.append(
+                (f"{sheet_id}!A{row_number}:{end_col}{row_number}", [row_values])
+            )
+        feishu.batch_update_sheet_cells(spreadsheet_token, append_updates)
 
-    append_updates: list[tuple[str, list[list[Any]]]] = []
-    for row_number, row_values in append_rows:
-        end_col = col_letter(len(row_values) - 1)
-        append_updates.append(
-            (f"{sheet_id}!A{row_number}:{end_col}{row_number}", [row_values])
-        )
-    feishu.batch_update_sheet_cells(spreadsheet_token, append_updates)
+    _sync_refresh_reminders(
+        feishu,
+        spreadsheet_token,
+        sheet_id,
+        rows,
+        header_index,
+        field_map,
+        warning_days=refresh_warning_days,
+        dry_run=dry_run,
+    )
 
     return success_count
 
@@ -509,9 +671,17 @@ def sync_points(config_path: Path, dry_run: bool = False) -> int:
     target = _resolve_feishu_target(feishu_cfg)
     feishu = FeishuClient(feishu_cfg["app_id"], feishu_cfg["app_secret"])
 
+    refresh_warning_days = int(feishu_cfg.get("refresh_warning_days", 7))
+
     if target["type"] == "spreadsheet":
         success_count = sync_spreadsheet(
-            feishu, target, field_map, match_by, jimeng_cfg, dry_run
+            feishu,
+            target,
+            field_map,
+            match_by,
+            jimeng_cfg,
+            dry_run,
+            refresh_warning_days=refresh_warning_days,
         )
     else:
         success_count = sync_bitable(
