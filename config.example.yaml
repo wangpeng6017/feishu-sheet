@@ -22,7 +22,7 @@ feishu:
 
 jimeng:
   auto_receive: false
-  # 每个账号可只注册即梦、只注册小云雀，或两者都有；按实际填写对应 Cookie 即可，未填的平台会自动跳过
+  # 每个账号可只注册部分平台；按实际填写对应凭证，未填的平台会自动跳过
   accounts:
     # 示例 1：仅即梦
     - channel: "channel1"
@@ -30,15 +30,22 @@ jimeng:
       phone: "13800000001"
       cookie: "x-web-secsdk-uid=...; sessionid=...; sid_guard=...; ttwid=..."
 
-    # 示例 2：仅小云雀（从 xyq.jianying.com 浏览器 curl 的 -b 复制，单引号包裹）
+    # 示例 2：仅小云雀（从 xyq.jianying.com 浏览器 curl 的 -b 复制）
     # - channel: "channel2"
     #   name: "name2"
     #   phone: "13800000002"
     #   xyq_cookie: "sessionid_pippitcn_web=...; sid_guard_pippitcn_web=...; ttwid=..."
 
-    # 示例 3：即梦 + 小云雀都有
+    # 示例 3：仅 LibTV（从 liblib.tv 网页复制 usertoken_online）
     # - channel: "channel3"
     #   name: "name3"
     #   phone: "13800000003"
+    #   libtv_token: "your-usertoken_online-value"
+
+    # 示例 4：多平台组合
+    # - channel: "channel4"
+    #   name: "name4"
+    #   phone: "13800000004"
     #   cookie: "..."
     #   xyq_cookie: "..."
+    #   libtv_token: "..."

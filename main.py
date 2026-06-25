@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""批量查询即梦 / 小云雀积分并同步到飞书表格。"""
+"""批量查询即梦 / 小云雀 / LibTV 积分并同步到飞书表格。"""
 
 from __future__ import annotations
 
@@ -14,10 +14,12 @@ import yaml
 
 from feishu_client import FeishuClient, col_letter
 from jimeng_client import check_token_live, get_credit, receive_credit
+import libtv_client
 
 PLATFORM_LABELS = {
     "jimeng": "即梦",
     "xyq": "小云雀",
+    "libtv": "LibTV",
 }
 
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -30,23 +32,37 @@ def _now_text() -> str:
 def _resolve_account_cookies(account: dict[str, Any]) -> dict[str, str | None]:
     jimeng_cookie = str(account.get("cookie") or "").strip() or None
     xyq_cookie = str(account.get("xyq_cookie") or "").strip() or None
+    libtv_token = str(account.get("libtv_token") or "").strip() or None
     sessionid = str(account.get("sessionid") or "").strip()
 
-    if not jimeng_cookie and not xyq_cookie and not sessionid:
+    if (
+        not jimeng_cookie
+        and not xyq_cookie
+        and not libtv_token
+        and not sessionid
+    ):
         raise ValueError(
-            "账号至少需配置一项：cookie（即梦）、xyq_cookie（小云雀）或 sessionid（即梦旧方式）"
+            "账号至少需配置一项：cookie（即梦）、xyq_cookie（小云雀）、"
+            "libtv_token（LibTV）或 sessionid（即梦旧方式）"
         )
 
     return {
         "jimeng": jimeng_cookie,
         "xyq": xyq_cookie,
+        "libtv_token": libtv_token,
         "sessionid": sessionid or "",
     }
 
 
 def _auth_error_message(platform: str) -> str:
     label = PLATFORM_LABELS.get(platform, platform)
-    return f"{label} 登录凭证无效，请从 xyq.jianying.com 或 jimeng.jianying.com 复制 curl Cookie"
+    if platform == "libtv":
+        return (
+            f"{label} 登录凭证无效，请从 liblib.tv 网页复制 usertoken_online 填到 libtv_token"
+        )
+    return (
+        f"{label} 登录凭证无效，请从 xyq.jianying.com 或 jimeng.jianying.com 复制 curl Cookie"
+    )
 
 
 def _fetch_account_credits(
@@ -58,10 +74,26 @@ def _fetch_account_credits(
     credits: dict[str, int] = {}
     errors: list[str] = []
 
-    for platform in ("jimeng", "xyq"):
-        cookie = cookies[platform]
+    for platform in ("jimeng", "xyq", "libtv"):
         label = PLATFORM_LABELS[platform]
 
+        if platform == "libtv":
+            libtv_token = cookies["libtv_token"]
+            if not libtv_token:
+                print(f"  [{label}] 未配置 libtv_token，跳过")
+                continue
+            try:
+                if not libtv_client.check_token_live(libtv_token):
+                    raise RuntimeError(_auth_error_message(platform))
+                total = libtv_client.get_credit(libtv_token)
+                credits[platform] = total
+                print(f"  [{label}] 算力: {total}")
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+                print(f"  [{label}] 查询失败: {exc}")
+            continue
+
+        cookie = cookies[platform]
         if platform == "xyq" and not cookie:
             print(f"  [{label}] 未配置 xyq_cookie，跳过")
             continue
@@ -98,7 +130,7 @@ def _fetch_account_credits(
 
 
 def _combined_credit(credit_totals: dict[str, int]) -> int:
-    """即梦 + 小云雀积分合计（未配置的平台不计入）。"""
+    """即梦 + 小云雀 + LibTV 积分合计（未配置的平台不计入）。"""
     return sum(credit_totals.values())
 
 
@@ -491,7 +523,7 @@ def sync_points(config_path: Path, dry_run: bool = False) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="同步即梦 / 小云雀积分到飞书表格")
+    parser = argparse.ArgumentParser(description="同步即梦 / 小云雀 / LibTV 积分到飞书表格")
     parser.add_argument(
         "-c",
         "--config",
