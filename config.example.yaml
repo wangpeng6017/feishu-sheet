@@ -19,6 +19,7 @@ feishu:
     updated_at: "更新时间"
     credit_refresh_at: "账号积分刷新时间"
     days_until_refresh: "距下次刷新(天)"
+    remark: "备注"
   # 匹配已有行: phone=按「账号」列 | name=按「名称」列
   match_by: "phone"
   # 距下次积分刷新不足该天数时，「距下次刷新(天)」列标红

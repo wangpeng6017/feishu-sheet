@@ -34,6 +34,10 @@ REFRESH_NORMAL_STYLE = {
     "foreColor": "#000000",
     "font": {"bold": False},
 }
+AUTH_FAIL_MARK = "请重新提供Cookie/Token"
+_STATUS_MARK_RE = re.compile(
+    r"^(?:请重新提供Cookie/Token|【(?:登录态失效|查询失败)】[^；;]*)[；;]?\s*"
+)
 
 
 def _today() -> date:
@@ -213,6 +217,28 @@ def _combined_credit(credit_totals: dict[str, int]) -> int:
     return sum(credit_totals.values())
 
 
+def _is_auth_error(exc: BaseException) -> bool:
+    return "登录凭证无效" in str(exc)
+
+
+def _fail_remark_text(exc: BaseException) -> str:
+    if _is_auth_error(exc):
+        return AUTH_FAIL_MARK
+    brief = str(exc).replace("\n", " ").strip()
+    if len(brief) > 60:
+        brief = brief[:57] + "..."
+    return f"【查询失败】{brief}"
+
+
+def _with_status_remark(existing: str, mark: str) -> str:
+    base = _STATUS_MARK_RE.sub("", (existing or "").strip()).strip("；; ").strip()
+    return f"{mark}；{base}" if base else mark
+
+
+def _clear_status_remark(existing: str) -> str:
+    return _STATUS_MARK_RE.sub("", (existing or "").strip()).strip("；; ").strip()
+
+
 def load_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(
@@ -298,6 +324,7 @@ _SHEET_FIELD_ORDER = (
     "updated_at",
     "credit_refresh_at",
     "days_until_refresh",
+    "remark",
 )
 
 
@@ -484,9 +511,29 @@ def sync_spreadsheet(
 
     row_index = _build_sheet_row_index(rows, header_index, match_by)
     updates: list[tuple[str, list[list[Any]]]] = []
+    styles: list[tuple[str, dict[str, Any]]] = []
     append_rows: list[tuple[int, list[Any]]] = []
     success_count = 0
     next_row = max(row_index.values(), default=1) + 1
+
+    def _existing_remark(row_number: int) -> str:
+        if "remark" not in header_index:
+            return ""
+        col = header_index["remark"]
+        row = rows[row_number - 1] if 0 < row_number <= len(rows) else []
+        return _cell_text(row[col] if col < len(row) else "")
+
+    def _write_remark(row_number: int, text: str, *, warn: bool) -> None:
+        if "remark" not in header_index:
+            return
+        col = header_index["remark"]
+        updates.append((_sheet_range(sheet_id, row_number, col), [[text]]))
+        styles.append(
+            (
+                _sheet_range(sheet_id, row_number, col),
+                REFRESH_WARN_STYLE if warn else REFRESH_NORMAL_STYLE,
+            )
+        )
 
     for account in jimeng_cfg.get("accounts", []):
         channel = account.get("channel", "")
@@ -499,7 +546,18 @@ def sync_spreadsheet(
         try:
             credit_totals = _fetch_account_credits(account, jimeng_cfg)
         except Exception as exc:
+            mark = _fail_remark_text(exc)
+            existing_row = row_index.get(match_key)
             print(f"  查询失败: {exc}")
+            if existing_row:
+                remark_text = _with_status_remark(_existing_remark(existing_row), mark)
+                _write_remark(existing_row, remark_text, warn=True)
+                if dry_run:
+                    print(f"  [dry-run] 第 {existing_row} 行备注标记为: {remark_text}")
+                else:
+                    print(f"  已标记第 {existing_row} 行: {remark_text}")
+            else:
+                print("  表格中无对应行，跳过标记")
             success_count += 1
             continue
 
@@ -526,6 +584,9 @@ def sync_spreadsheet(
                         [[now_text]],
                     )
                 )
+            if "remark" in header_index:
+                cleared = _clear_status_remark(_existing_remark(existing_row))
+                _write_remark(existing_row, cleared, warn=False)
             action = f"更新第 {existing_row} 行"
         else:
             max_col = max(header_index.values())
@@ -558,6 +619,8 @@ def sync_spreadsheet(
         print(f"\n[dry-run] 将更新 {len(updates)} 个单元格，新增 {len(append_rows)} 行")
     else:
         feishu.batch_update_sheet_cells(spreadsheet_token, updates)
+        if styles:
+            feishu.batch_update_sheet_styles(spreadsheet_token, styles)
 
         append_updates: list[tuple[str, list[list[Any]]]] = []
         for row_number, row_values in append_rows:
@@ -609,7 +672,23 @@ def sync_bitable(
         try:
             credit_totals = _fetch_account_credits(account, jimeng_cfg)
         except Exception as exc:
+            mark = _fail_remark_text(exc)
+            existing = record_index.get(match_key)
             print(f"  查询失败: {exc}")
+            if existing and field_map.get("remark"):
+                old_remark = _cell_text(
+                    existing.get("fields", {}).get(field_map["remark"])
+                )
+                fields = {
+                    field_map["remark"]: _with_status_remark(old_remark, mark),
+                }
+                if dry_run:
+                    print(f"  [dry-run] 备注标记为: {fields[field_map['remark']]}")
+                else:
+                    feishu.update_record(
+                        app_token, table_id, existing["record_id"], fields
+                    )
+                    print(f"  已标记: {fields[field_map['remark']]}")
             success_count += 1
             continue
 
@@ -621,6 +700,11 @@ def sync_bitable(
             fields: dict[str, Any] = {}
             if "current_credit" in field_map:
                 fields[field_map["current_credit"]] = total_credit
+            if field_map.get("remark"):
+                old_remark = _cell_text(
+                    existing.get("fields", {}).get(field_map["remark"])
+                )
+                fields[field_map["remark"]] = _clear_status_remark(old_remark)
         else:
             fields = {
                 field_map["channel"]: channel,
