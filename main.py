@@ -34,10 +34,18 @@ REFRESH_NORMAL_STYLE = {
     "foreColor": "#000000",
     "font": {"bold": False},
 }
-AUTH_FAIL_MARK = "请重新提供Cookie/Token"
-_STATUS_MARK_RE = re.compile(
-    r"^(?:请重新提供Cookie/Token|【(?:登录态失效|查询失败)】[^；;]*)[；;]?\s*"
-)
+STATUS_VALID = "有效"
+STATUS_INVALID = "失效"
+STATUS_VALID_STYLE = {
+    "backColor": "#FFFFFF",
+    "foreColor": "#006100",
+    "font": {"bold": True},
+}
+STATUS_INVALID_STYLE = {
+    "backColor": "#FFFFFF",
+    "foreColor": "#9C0006",
+    "font": {"bold": True},
+}
 
 
 def _today() -> date:
@@ -217,28 +225,6 @@ def _combined_credit(credit_totals: dict[str, int]) -> int:
     return sum(credit_totals.values())
 
 
-def _is_auth_error(exc: BaseException) -> bool:
-    return "登录凭证无效" in str(exc)
-
-
-def _fail_remark_text(exc: BaseException) -> str:
-    if _is_auth_error(exc):
-        return AUTH_FAIL_MARK
-    brief = str(exc).replace("\n", " ").strip()
-    if len(brief) > 60:
-        brief = brief[:57] + "..."
-    return f"【查询失败】{brief}"
-
-
-def _with_status_remark(existing: str, mark: str) -> str:
-    base = _STATUS_MARK_RE.sub("", (existing or "").strip()).strip("；; ").strip()
-    return f"{mark}；{base}" if base else mark
-
-
-def _clear_status_remark(existing: str) -> str:
-    return _STATUS_MARK_RE.sub("", (existing or "").strip()).strip("；; ").strip()
-
-
 def load_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(
@@ -288,6 +274,7 @@ def _resolve_feishu_target(feishu_cfg: dict[str, Any]) -> dict[str, str]:
 
 _FIELD_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "current_credit": ("当前积分", "当前即梦积分"),
+    "status": ("状态",),
 }
 
 
@@ -322,9 +309,9 @@ _SHEET_FIELD_ORDER = (
     "phone",
     "current_credit",
     "updated_at",
+    "status",
     "credit_refresh_at",
     "days_until_refresh",
-    "remark",
 )
 
 
@@ -346,9 +333,24 @@ def _ensure_sheet_headers(
 
     for key in _SHEET_FIELD_ORDER:
         titles = _field_header_titles(field_map, key)
-        if not titles or any(title in header_to_col for title in titles):
+        if not titles:
             continue
-        title = titles[0]
+        primary = titles[0]
+
+        # 旧别名表头统一重命名为配置中的正式列名
+        if primary not in header_to_col:
+            for alias in titles[1:]:
+                if alias in header_to_col:
+                    col = header_to_col.pop(alias)
+                    row[col] = primary
+                    header_to_col[primary] = col
+                    cell = f"{col_letter(col)}1"
+                    updates.append((f"{sheet_id}!{cell}:{cell}", [[primary]]))
+                    print(f"  飞书表头「{alias}」将重命名为「{primary}」（{cell}）")
+                    break
+
+        if any(title in header_to_col for title in titles):
+            continue
 
         insert_at = 0
         for prev in _SHEET_FIELD_ORDER:
@@ -365,11 +367,11 @@ def _ensure_sheet_headers(
         while len(row) <= insert_at:
             row.append(None)
 
-        row[insert_at] = title
-        header_to_col[title] = insert_at
+        row[insert_at] = primary
+        header_to_col[primary] = insert_at
         cell = f"{col_letter(insert_at)}1"
-        updates.append((f"{sheet_id}!{cell}:{cell}", [[title]]))
-        print(f"  飞书表头缺少「{title}」，将写入第 {insert_at + 1} 列（{cell}）")
+        updates.append((f"{sheet_id}!{cell}:{cell}", [[primary]]))
+        print(f"  飞书表头缺少「{primary}」，将写入第 {insert_at + 1} 列（{cell}）")
 
     if updates and not dry_run:
         feishu.batch_update_sheet_cells(spreadsheet_token, updates)
@@ -516,22 +518,15 @@ def sync_spreadsheet(
     success_count = 0
     next_row = max(row_index.values(), default=1) + 1
 
-    def _existing_remark(row_number: int) -> str:
-        if "remark" not in header_index:
-            return ""
-        col = header_index["remark"]
-        row = rows[row_number - 1] if 0 < row_number <= len(rows) else []
-        return _cell_text(row[col] if col < len(row) else "")
-
-    def _write_remark(row_number: int, text: str, *, warn: bool) -> None:
-        if "remark" not in header_index:
+    def _write_status(row_number: int, status: str) -> None:
+        if "status" not in header_index:
             return
-        col = header_index["remark"]
-        updates.append((_sheet_range(sheet_id, row_number, col), [[text]]))
+        col = header_index["status"]
+        updates.append((_sheet_range(sheet_id, row_number, col), [[status]]))
         styles.append(
             (
                 _sheet_range(sheet_id, row_number, col),
-                REFRESH_WARN_STYLE if warn else REFRESH_NORMAL_STYLE,
+                STATUS_VALID_STYLE if status == STATUS_VALID else STATUS_INVALID_STYLE,
             )
         )
 
@@ -546,16 +541,14 @@ def sync_spreadsheet(
         try:
             credit_totals = _fetch_account_credits(account, jimeng_cfg)
         except Exception as exc:
-            mark = _fail_remark_text(exc)
             existing_row = row_index.get(match_key)
             print(f"  查询失败: {exc}")
             if existing_row:
-                remark_text = _with_status_remark(_existing_remark(existing_row), mark)
-                _write_remark(existing_row, remark_text, warn=True)
+                _write_status(existing_row, STATUS_INVALID)
                 if dry_run:
-                    print(f"  [dry-run] 第 {existing_row} 行备注标记为: {remark_text}")
+                    print(f"  [dry-run] 第 {existing_row} 行状态标记为: {STATUS_INVALID}")
                 else:
-                    print(f"  已标记第 {existing_row} 行: {remark_text}")
+                    print(f"  已标记第 {existing_row} 行状态: {STATUS_INVALID}")
             else:
                 print("  表格中无对应行，跳过标记")
             success_count += 1
@@ -584,9 +577,7 @@ def sync_spreadsheet(
                         [[now_text]],
                     )
                 )
-            if "remark" in header_index:
-                cleared = _clear_status_remark(_existing_remark(existing_row))
-                _write_remark(existing_row, cleared, warn=False)
+            _write_status(existing_row, STATUS_VALID)
             action = f"更新第 {existing_row} 行"
         else:
             max_col = max(header_index.values())
@@ -600,6 +591,14 @@ def sync_spreadsheet(
                 new_row[header_index["current_credit"]] = total_credit
             if "updated_at" in header_index:
                 new_row[header_index["updated_at"]] = now_text
+            if "status" in header_index:
+                new_row[header_index["status"]] = STATUS_VALID
+                styles.append(
+                    (
+                        _sheet_range(sheet_id, next_row, header_index["status"]),
+                        STATUS_VALID_STYLE,
+                    )
+                )
             append_rows.append((next_row, new_row))
             action = f"新增第 {next_row} 行"
             next_row += 1
@@ -609,9 +608,9 @@ def sync_spreadsheet(
         )
         credit_text = f"当前积分={total_credit}（{summary}）" if len(credit_totals) > 1 else f"当前积分={total_credit}"
         if dry_run:
-            print(f"  [dry-run] {action}，{credit_text}，更新时间={now_text}")
+            print(f"  [dry-run] {action}，{credit_text}，更新时间={now_text}，状态={STATUS_VALID}")
         else:
-            print(f"  {action}，{credit_text}，更新时间={now_text}")
+            print(f"  {action}，{credit_text}，更新时间={now_text}，状态={STATUS_VALID}")
 
         success_count += 1
 
@@ -619,8 +618,6 @@ def sync_spreadsheet(
         print(f"\n[dry-run] 将更新 {len(updates)} 个单元格，新增 {len(append_rows)} 行")
     else:
         feishu.batch_update_sheet_cells(spreadsheet_token, updates)
-        if styles:
-            feishu.batch_update_sheet_styles(spreadsheet_token, styles)
 
         append_updates: list[tuple[str, list[list[Any]]]] = []
         for row_number, row_values in append_rows:
@@ -629,6 +626,9 @@ def sync_spreadsheet(
                 (f"{sheet_id}!A{row_number}:{end_col}{row_number}", [row_values])
             )
         feishu.batch_update_sheet_cells(spreadsheet_token, append_updates)
+
+        if styles:
+            feishu.batch_update_sheet_styles(spreadsheet_token, styles)
 
     _sync_refresh_reminders(
         feishu,
@@ -672,23 +672,17 @@ def sync_bitable(
         try:
             credit_totals = _fetch_account_credits(account, jimeng_cfg)
         except Exception as exc:
-            mark = _fail_remark_text(exc)
             existing = record_index.get(match_key)
             print(f"  查询失败: {exc}")
-            if existing and field_map.get("remark"):
-                old_remark = _cell_text(
-                    existing.get("fields", {}).get(field_map["remark"])
-                )
-                fields = {
-                    field_map["remark"]: _with_status_remark(old_remark, mark),
-                }
+            if existing and field_map.get("status"):
+                fields = {field_map["status"]: STATUS_INVALID}
                 if dry_run:
-                    print(f"  [dry-run] 备注标记为: {fields[field_map['remark']]}")
+                    print(f"  [dry-run] 状态标记为: {STATUS_INVALID}")
                 else:
                     feishu.update_record(
                         app_token, table_id, existing["record_id"], fields
                     )
-                    print(f"  已标记: {fields[field_map['remark']]}")
+                    print(f"  已标记状态: {STATUS_INVALID}")
             success_count += 1
             continue
 
@@ -700,11 +694,8 @@ def sync_bitable(
             fields: dict[str, Any] = {}
             if "current_credit" in field_map:
                 fields[field_map["current_credit"]] = total_credit
-            if field_map.get("remark"):
-                old_remark = _cell_text(
-                    existing.get("fields", {}).get(field_map["remark"])
-                )
-                fields[field_map["remark"]] = _clear_status_remark(old_remark)
+            if field_map.get("status"):
+                fields[field_map["status"]] = STATUS_VALID
         else:
             fields = {
                 field_map["channel"]: channel,
@@ -714,6 +705,8 @@ def sync_bitable(
                 fields[field_map["phone"]] = phone
             if "current_credit" in field_map:
                 fields[field_map["current_credit"]] = total_credit
+            if field_map.get("status"):
+                fields[field_map["status"]] = STATUS_VALID
 
         if field_map.get("updated_at"):
             fields[field_map["updated_at"]] = now_text
@@ -730,10 +723,10 @@ def sync_bitable(
 
         if existing:
             feishu.update_record(app_token, table_id, existing["record_id"], fields)
-            print(f"  已更新: {credit_text}，更新时间: {now_text}")
+            print(f"  已更新: {credit_text}，更新时间: {now_text}，状态: {STATUS_VALID}")
         else:
             to_create.append({"fields": fields})
-            print(f"  待新增记录: {credit_text}，更新时间: {now_text}")
+            print(f"  待新增记录: {credit_text}，更新时间: {now_text}，状态: {STATUS_VALID}")
 
         success_count += 1
 
